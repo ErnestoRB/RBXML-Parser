@@ -3,11 +3,39 @@ mod parser {
 
     type ParserResult<'a, R> = Result<(&'a str, R), &'a str>;
 
+    type AttributePair = (String, String);
+    pub trait Parser<'a, Output> {
+        fn parse(&self, input: &'a str) -> ParserResult<'a, Output>;
+    }
+
+    impl<'a, Function, Output> Parser<'a, Output> for Function
+    where
+        Function: Fn(&'a str) -> ParserResult<'a, Output>,
+    {
+        fn parse(&self, input: &'a str) -> ParserResult<'a, Output> {
+            self(input)
+        }
+    }
+    struct BoxedParser<'a, T> {
+        parser: Box<dyn Parser<'a, T> + 'a>,
+    }
+
+    impl<'a, T> BoxedParser<'a, T> {
+        fn new<P>(parser: P) -> Self
+        where
+            P: Parser<'a, T> + 'a,
+        {
+            BoxedParser {
+                parser: Box::new(parser),
+            }
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct Element {
-        name: String,
-        attributes: Vec<(String, String)>,
-        children: Vec<Element>,
+    pub struct Element {
+        pub name: String,
+        pub attributes: Vec<(String, String)>,
+        pub children: Vec<Element>,
     }
 
     pub fn a_parser(input: &str) -> ParserResult<()> {
@@ -148,21 +176,82 @@ mod parser {
         }
     }
 
-    pub trait Parser<'a, Output> {
-        fn parse(&self, input: &'a str) -> ParserResult<'a, Output>;
+    pub fn any_char(input: &str) -> ParserResult<char> {
+        match input.chars().next() {
+            Some(c) => Ok((&input[c.len_utf8()..], c)),
+            _ => Err(input),
+        }
     }
 
-    impl<'a, Function, Output> Parser<'a, Output> for Function
-    where
-        Function: Fn(&'a str) -> ParserResult<'a, Output>,
-    {
-        fn parse(&self, input: &'a str) -> ParserResult<'a, Output> {
-            self(input)
+    pub fn predicate<'a, Out>(
+        parser: impl Parser<'a, Out>,
+        predicate: impl Fn(&Out) -> bool,
+    ) -> impl Parser<'a, Out> {
+        move |input| match parser.parse(input) {
+            Ok((out, matched)) => {
+                if predicate(&matched) {
+                    return Ok((out, matched));
+                }
+                return Err(input);
+            }
+            _ => Err(input),
         }
+    }
+
+    pub fn parse_whitespace<'a>() -> impl Parser<'a, char> {
+        predicate(any_char, |char| char.is_whitespace())
+    }
+
+    pub fn quoted_string<'a>() -> impl Parser<'a, String> {
+        map(
+            right(
+                parser_builder("\""),
+                left(
+                    times(predicate(any_char, |char| *char != '"'), 1..),
+                    parser_builder("\""),
+                ),
+            ),
+            |chars| chars.into_iter().collect(),
+        )
+    }
+    pub fn attribute<'a>() -> impl Parser<'a, AttributePair> {
+        combinator(
+            map(
+                times(predicate(any_char, |char| char.is_alphabetic()), 1..),
+                |char| char.into_iter().collect(),
+            ),
+            right(parser_builder("="), quoted_string()),
+        )
+    }
+    pub fn attributes<'a>() -> impl Parser<'a, Vec<AttributePair>> {
+        times(right(times(parse_whitespace(), 1..), attribute()), ..)
+    }
+
+    pub fn element_start<'a>() -> impl Parser<'a, (String, Vec<AttributePair>)> {
+        right(
+            parser_builder("<"),
+            combinator(match_identifier, attributes()),
+        )
+    }
+
+    pub fn single_element<'a>() -> impl Parser<'a, Element> {
+        map(
+            left(
+                element_start(),
+                combinator(times(parse_whitespace(), ..), parser_builder("/>")),
+            ),
+            |(name, attributes)| Element {
+                name,
+                attributes,
+                children: vec![],
+            },
+        )
     }
 }
 
 mod testing {
+
+    use std::vec;
 
     use crate::parser::Parser;
 
@@ -243,18 +332,115 @@ mod testing {
 
     #[test]
     fn times() {
-        let mut one_more_matched = Vec::new();
-        one_more_matched.push(());
-        one_more_matched.push(());
+        let zero_more = parser::times(parser::parser_builder("a"), 0..);
+        assert_eq!(zero_more.parse("xx"), Ok(("xx", vec![])));
+        assert_eq!(zero_more.parse("aaax"), Ok(("x", vec![(), (), ()])));
         let one_more = parser::times(parser::parser_builder("."), 1..);
-        assert_eq!(one_more.parse(".."), Ok(("", one_more_matched)));
+        assert_eq!(one_more.parse(".."), Ok(("", vec![(), ()])));
         assert_eq!(one_more.parse(""), Err(""));
         let two_more = parser::times(parser::parser_builder("."), 2..);
-        let mut two_more_matched = Vec::new();
-        two_more_matched.push(());
-        two_more_matched.push(());
-        two_more_matched.push(());
-        assert_eq!(two_more.parse("..."), Ok(("", two_more_matched)));
+        assert_eq!(two_more.parse("..."), Ok(("", vec![(), (), ()])));
         assert_eq!(two_more.parse("."), Err("")); // '.' consumed
+
+        let all_except_quotes = parser::map(
+            parser::times(
+                parser::predicate(parser::any_char, |char| *char != '"'),
+                1..,
+            ),
+            |chars| chars.into_iter().collect(),
+        );
+        assert_eq!(
+            all_except_quotes.parse("asdasd"),
+            Ok(("", "asdasd".to_string()))
+        );
+        assert_eq!(
+            all_except_quotes.parse("asd\"asd"),
+            Ok(("\"asd", "asd".to_string()))
+        );
+        assert_eq!(all_except_quotes.parse("\"asd"), Err("\"asd"))
+    }
+
+    #[test]
+    fn predicate_char() {
+        let conditional_parse = parser::predicate(parser::any_char, |char| *char == '*');
+        assert_eq!(conditional_parse.parse("*nix"), Ok(("nix", '*')));
+        assert_eq!(conditional_parse.parse("lol"), Err("lol"));
+    }
+
+    #[test]
+    fn quoted_string() {
+        assert_eq!(
+            parser::quoted_string().parse("\"hola\""),
+            Ok(("", "hola".to_string())),
+        )
+    }
+
+    #[test]
+    fn attribute() {
+        assert_eq!(
+            parser::attribute().parse("a=\"hola\""),
+            Ok(("", ("a".to_string(), "hola".to_string())))
+        )
+    }
+
+    #[test]
+    fn attributes() {
+        assert_eq!(
+            parser::attributes().parse("   a=\"hola\"  b=\"adios\""),
+            Ok((
+                "",
+                vec![
+                    ("a".to_string(), "hola".to_string()),
+                    ("b".to_string(), "adios".to_string())
+                ]
+            ))
+        )
+    }
+
+    #[test]
+    fn element_start() {
+        assert_eq!(
+            parser::element_start().parse("<Component props=\"hola\""),
+            Ok((
+                "",
+                (
+                    "Component".to_string(),
+                    vec![("props".to_string(), "hola".to_string())]
+                )
+            ))
+        );
+        assert_eq!(
+            parser::element_start().parse("<Component props=\"hola\">"),
+            Ok((
+                ">",
+                (
+                    "Component".to_string(),
+                    vec![("props".to_string(), "hola".to_string())]
+                )
+            ))
+        );
+        assert_eq!(
+            parser::element_start().parse("Component props=\"hola\">"),
+            Err("Component props=\"hola\">",)
+        )
+    }
+
+    #[test]
+    fn single_element() {
+        assert_eq!(
+            parser::single_element().parse("<Component    props=\"hola\"  />"),
+            Ok((
+                "",
+                parser::Element {
+                    name: "Component".to_string(),
+                    attributes: vec![("props".to_string(), "hola".to_string())],
+                    children: vec![]
+                }
+            ))
+        );
+        assert_eq!(
+            parser::single_element().parse("<Component props=\"hola\" >"),
+            Err(">")
+        );
     }
 }
