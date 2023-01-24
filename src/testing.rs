@@ -1,22 +1,13 @@
-use crate::parser;
 use crate::parser::utils::Parser;
-
+use crate::parser::{self, Element};
 use std::vec;
-
-#[test]
-fn a_parser() {
-    let string = "equivocado";
-    let string2 = "ahuevo";
-    assert_eq!(parser::a_parser(string), Err(string));
-    assert_eq!(parser::a_parser(string2), Ok(("huevo", ())));
-}
 
 #[test]
 fn parser_builder() {
     let matching = "<";
     let parser = parser::parser_builder(matching);
-    assert_eq!(parser("dasdasd"), Err("dasdasd"));
-    assert_eq!(parser("<h1>"), Ok(("h1>", ())));
+    assert_eq!(parser.parse("dasdasd"), Err("dasdasd"));
+    assert_eq!(parser.parse("<h1>"), Ok(("h1>", ())));
 }
 
 #[test]
@@ -45,7 +36,7 @@ fn combinator() {
 
 #[test]
 fn map() {
-    let mapped = parser::map(|input| Ok((input, "ok")), |_output| 5);
+    let mapped = parser::constraint(|input| Ok((input, "ok"))).map(|_output| 5);
     let str = "useless string";
     assert_eq!(mapped.parse(str), Ok((str, 5)));
 }
@@ -78,23 +69,19 @@ fn one_or_more() {
 
 #[test]
 fn times() {
-    let zero_more = parser::times(parser::parser_builder("a"), 0..);
+    let zero_more = parser::parser_builder("a").times(0..);
     assert_eq!(zero_more.parse("xx"), Ok(("xx", vec![])));
     assert_eq!(zero_more.parse("aaax"), Ok(("x", vec![(), (), ()])));
-    let one_more = parser::times(parser::parser_builder("."), 1..);
+    let one_more = parser::parser_builder(".").times(1..);
     assert_eq!(one_more.parse(".."), Ok(("", vec![(), ()])));
     assert_eq!(one_more.parse(""), Err(""));
-    let two_more = parser::times(parser::parser_builder("."), 2..);
+    let two_more = parser::parser_builder(".").times(2..);
     assert_eq!(two_more.parse("..."), Ok(("", vec![(), (), ()])));
     assert_eq!(two_more.parse("."), Err("")); // '.' consumed
 
-    let all_except_quotes = parser::map(
-        parser::times(
-            parser::predicate(parser::any_char, |char| *char != '"'),
-            1..,
-        ),
-        |chars| chars.into_iter().collect(),
-    );
+    let all_except_quotes = parser::predicate(parser::any_char, |char| *char != '"')
+        .times(1..)
+        .map(|chars| chars.into_iter().collect());
     assert_eq!(
         all_except_quotes.parse("asdasd"),
         Ok(("", "asdasd".to_string()))
@@ -146,7 +133,7 @@ fn attributes() {
 #[test]
 fn element_start() {
     assert_eq!(
-        parser::element_start().parse("<Component props=\"hola\""),
+        parser::element_start().parse("< Component props=\"hola\""),
         Ok((
             "",
             (
@@ -188,4 +175,86 @@ fn single_element() {
         parser::single_element().parse("<Component props=\"hola\" >"),
         Err(">")
     );
+}
+
+#[test]
+fn element_end() {
+    assert_eq!(
+        parser::parent_element_opening_end().parse("      >"),
+        Ok(("", ()))
+    );
+    assert_eq!(
+        parser::parent_element_opening_end().parse("      />"),
+        Err("/>")
+    );
+}
+
+#[test]
+fn closing_element() {
+    assert_eq!(
+        parser::closing_element("asd".to_string()).parse("</   asd   >"),
+        Ok(("", "asd".to_string()))
+    );
+    assert_eq!(
+        parser::closing_element("asd".to_string()).parse("<   asd   >"),
+        Err("<   asd   >")
+    );
+}
+
+#[test]
+fn parent_element() {
+    assert_eq!(
+        parser::parent_element().parse("<hola></hola>"),
+        Ok((
+            "",
+            Element {
+                name: "hola".to_string(),
+                attributes: vec![],
+                children: vec![],
+            }
+        ))
+    );
+}
+
+#[test]
+fn xml_parser() {
+    let doc = r#"
+        <top label="Top">
+        
+            <semi-bottom label="Bottom"/>
+
+            <middle>
+                <bottom label="Another bottom"/>
+            </middle>
+        </top>"#;
+    let parsed_doc = Element {
+        name: "top".to_string(),
+        attributes: vec![("label".to_string(), "Top".to_string())],
+        children: vec![
+            Element {
+                name: "semi-bottom".to_string(),
+                attributes: vec![("label".to_string(), "Bottom".to_string())],
+                children: vec![],
+            },
+            Element {
+                name: "middle".to_string(),
+                attributes: vec![],
+                children: vec![Element {
+                    name: "bottom".to_string(),
+                    attributes: vec![("label".to_string(), "Another bottom".to_string())],
+                    children: vec![],
+                }],
+            },
+        ],
+    };
+    assert_eq!(Ok(("", parsed_doc)), parser::element().parse(doc));
+}
+
+#[test]
+fn mismatched_closing_tag() {
+    let doc = r#"
+        <top>
+            <bottom/>
+        </middle>"#;
+    assert_eq!(Err("</middle>"), parser::element().parse(doc));
 }
